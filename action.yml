@@ -1,5 +1,5 @@
 name: 'Accessibility Pro Scan'
-description: 'Run a WCAG 2.2 AA scan on every PR. Posts an impact-ranked comment with a deep link to sandbox-validated Copy-as-PR fixes.'
+description: 'WCAG 2.2 accessibility gate for pull requests. Five engines, live-DOM verification, one sticky comment linking to verified code fixes.'
 author: 'Accessibility Pro'
 branding:
   icon: 'shield'
@@ -7,77 +7,194 @@ branding:
 
 inputs:
   url:
-    description: 'URL to scan. Use secrets.STAGING_URL for auth-gated sites.'
+    description: |
+      URL to scan. Accepts several, one per line, to gate more than one
+      page in a single step. Store auth-gated preview URLs as secrets.
     required: true
   wcag-level:
-    description: 'WCAG conformance level: A, AA, or AAA.'
+    description: 'Conformance level to scan against: A, AA, or AAA.'
     required: false
     default: 'AA'
   fail-on:
-    description: 'Fail the action on first: error (critical+high), warning (medium+), or none.'
+    description: |
+      Which findings fail the build.
+        error   - any critical or high-severity violation (default)
+        warning - any medium-or-worse violation
+        wcag    - any Level A or AA success-criterion failure, at any severity
+        none    - report only, never fails
+      The threshold is evaluated by the scanner itself, so the build
+      verdict and the hosted report can never disagree.
     required: false
     default: 'error'
-  accessibility-pro-token:
-    description: 'Optional API token. Unlocks Team-quota and Copy-as-PR on PR comments. Get one at https://www.accessibilitypro.app/pricing.'
+  thresholds:
+    description: |
+      Advanced. A JSON object of per-severity allowances that overrides
+      `fail-on`, e.g. {"critical": 0, "high": 3}. Useful while paying
+      down an existing backlog. Omitted severities are unlimited.
     required: false
     default: ''
-  comment-on-pr:
-    description: 'Post results as a PR comment when running on pull_request events.'
+  fail-on-unrepresentative:
+    description: |
+      Fail the build when the scanner could not see the real page - a
+      bot-detection challenge, a full-page consent wall, an HTTP block,
+      or a scan whose false-positive filtering or confidence scoring did
+      not complete. A near-clean result on an interstitial is not a
+      pass. Ignored when `fail-on` is `none`.
     required: false
     default: 'true'
+  ignore-rules:
+    description: |
+      Findings you have reviewed and do not want gating the build, one
+      per line: a rule id as the report and SARIF print it
+      (ibm-input_checkboxes_grouped), optionally followed by @ and a
+      fragment of the URL or selector it applies to
+      (color-contrast@/pricing). Ignored findings stay in the report and
+      the score; the comment says what was ignored, and an entry that
+      matches nothing is reported so a typo cannot pass a build.
+    required: false
+    default: ''
+  engines:
+    description: |
+      Comma-separated subset of engines to run. Defaults to all five:
+      axe-core, lighthouse, pa11y, ibm-equal-access, arc-style. Trimming
+      the list speeds up a scan at the cost of cross-engine corroboration.
+    required: false
+    default: ''
+  ai:
+    description: |
+      `false` keeps this scan away from every AI provider: no page content
+      is sent to a model, and the report says "AI off (scan request)".
+      Every finding still comes from the engines; only the plain-language
+      explanations are skipped. An account with AI switched off on its
+      Account page gets no AI whatever this says, and a scan sent with
+      the cf-access inputs (a signed-in scan) uses AI only if the account
+      opted in there.
+    required: false
+    default: 'true'
+  comment:
+    description: |
+      Pull-request comment behaviour: `sticky` updates one comment in
+      place on every push, `new` adds one per run, `off` disables it.
+    required: false
+    default: 'sticky'
+  comment-on-pr:
+    description: 'Deprecated. Use `comment: off` instead of `comment-on-pr: false`.'
+    required: false
+    default: ''
+  top-issues:
+    description: 'How many findings to list inline, ranked by measured impact (1-25).'
+    required: false
+    default: '5'
+  annotations:
+    description: |
+      Emit build-failing findings as workflow annotations so they appear
+      in the run's Annotations panel.
+    required: false
+    default: 'true'
+  sarif-file:
+    description: |
+      Path to write a SARIF 2.1.0 report to. Upload it with
+      github/codeql-action/upload-sarif to track accessibility findings
+      in the Security tab, with stable fingerprints across runs.
+    required: false
+    default: ''
+  results-file:
+    description: 'Path to write the raw scan payload (JSON) to, for your own tooling.'
+    required: false
+    default: ''
+  accessibility-pro-token:
+    description: |
+      Optional API token. Scans count against your plan's CI allowance
+      instead of the free tier and are attributed to your account, which
+      is what lets you open the report signed in and generate Copy-as-PR
+      fixes. Create one under API tokens at
+      https://www.accessibilitypro.app/account#api-tokens and store it as
+      a repository secret. A revoked or mistyped token fails the step
+      rather than falling back to the free tier.
+    required: false
+    default: ''
+  cf-access-client-id:
+    description: |
+      Client ID of a Cloudflare Access service token, for a site behind
+      Cloudflare Access (typically staging). Use with
+      `cf-access-client-secret`, both stored as repository secrets. Sent
+      only to the scanned site's hosts, never across a redirect. Needs an
+      `accessibility-pro-token` on the Developer plan or above.
+    required: false
+    default: ''
+  cf-access-client-secret:
+    description: 'Client Secret of the same Cloudflare Access service token.'
+    required: false
+    default: ''
+  read-only:
+    description: |
+      A scan that uses the service token above is read-only: requests
+      that could change data are blocked and the form error check is skipped.
+      Set to `false` for a test site where the scanner may submit forms.
+      Has no effect on a scan of a public site.
+    required: false
+    default: 'true'
+  github-token:
+    description: 'Token used to post the pull-request comment.'
+    required: false
+    default: ${{ github.token }}
+  timeout-minutes:
+    description: |
+      Per-attempt budget for one scan request (1-60). A five-engine scan
+      of a heavy SPA can legitimately run past five minutes.
+    required: false
+    default: '15'
+  retries:
+    description: 'Retries for transient backend or network failures (0-3).'
+    required: false
+    default: '1'
   backend-url:
-    description: 'Override for the Accessibility Pro backend. Useful for self-hosted.'
+    description: 'Override for the Accessibility Pro backend. For self-hosted deployments.'
     required: false
     default: 'https://access-pro-ai-production.up.railway.app'
   report-domain:
-    description: 'Override for the hosted-report domain. Change if you self-host the frontend.'
+    description: 'Override for the hosted-report domain. For a self-hosted frontend.'
     required: false
     default: 'https://www.accessibilitypro.app'
+  oidc-audience:
+    description: 'Audience requested when minting the GitHub OIDC token. Change only when self-hosting.'
+    required: false
+    default: 'https://api.accessibilitypro.app'
 
 outputs:
-  scan-id:
-    description: 'The scan id, useful for deep-linking to the hosted report.'
-    value: ${{ steps.scan.outputs.scan-id }}
-  violations-critical:
-    description: 'Count of critical-severity violations.'
-    value: ${{ steps.scan.outputs.violations-critical }}
-  violations-high:
-    description: 'Count of high-severity violations.'
-    value: ${{ steps.scan.outputs.violations-high }}
+  passed:
+    description: 'true when every scanned URL cleared the gate.'
   score:
-    description: 'Accessibility score (0 to 100).'
-    value: ${{ steps.scan.outputs.score }}
+    description: 'Accessibility score (0-100) of the lowest-scoring URL.'
+  scan-id:
+    description: 'Scan id of the lowest-scoring URL, for deep links of your own.'
   report-url:
-    description: 'Direct link to the hosted report.'
-    value: ${{ steps.scan.outputs.report-url }}
+    description: 'Hosted report for the lowest-scoring URL.'
+  violations-critical:
+    description: 'Critical-severity violations across every scanned URL.'
+  violations-high:
+    description: 'High-severity violations across every scanned URL.'
+  violations-medium:
+    description: 'Medium-severity violations across every scanned URL.'
+  violations-low:
+    description: 'Low-severity violations across every scanned URL.'
+  total-issues:
+    description: 'Total findings reported as violations.'
+  manual-review-count:
+    description: 'Findings that could not be automatically verified and need a human look.'
+  warnings-count:
+    description: 'Scan warnings that make the result unrepresentative (0 when the scan was clean).'
+  engines-used:
+    description: 'Comma-separated engines that actually ran.'
+  plan-tier:
+    description: 'Plan the scan was billed to. Empty when running anonymously on the free tier.'
+  ci-scans-remaining:
+    description: 'CI scans left in this month allowance. Empty when anonymous or unlimited.'
+  sarif-file:
+    description: 'Absolute path of the written SARIF file, when `sarif-file` was set.'
+  results-file:
+    description: 'Absolute path of the written raw payload, when `results-file` was set.'
 
 runs:
-  using: 'composite'
-  steps:
-    - name: Set up Node
-      uses: actions/setup-node@v4
-      with:
-        node-version: '20'
-
-    - name: Run scan
-      id: scan
-      shell: bash
-      env:
-        INPUT_URL: ${{ inputs.url }}
-        INPUT_WCAG_LEVEL: ${{ inputs.wcag-level }}
-        INPUT_FAIL_ON: ${{ inputs.fail-on }}
-        INPUT_TOKEN: ${{ inputs.accessibility-pro-token }}
-        INPUT_BACKEND_URL: ${{ inputs.backend-url }}
-        INPUT_REPORT_DOMAIN: ${{ inputs.report-domain }}
-      run: node ${{ github.action_path }}/scripts/scan.mjs
-
-    - name: Comment on PR
-      if: ${{ github.event_name == 'pull_request' && inputs.comment-on-pr == 'true' }}
-      shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
-        INPUT_SCAN_ID: ${{ steps.scan.outputs.scan-id }}
-        INPUT_BACKEND_URL: ${{ inputs.backend-url }}
-        INPUT_REPORT_DOMAIN: ${{ inputs.report-domain }}
-        INPUT_URL: ${{ inputs.url }}
-      run: node ${{ github.action_path }}/scripts/comment.mjs
+  using: 'node24'
+  main: 'src/main.mjs'

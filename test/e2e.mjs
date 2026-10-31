@@ -1,0 +1,998 @@
+/**
+ * End-to-end tests for the Accessibility Pro action.
+ *
+ * Run with `node test/e2e.mjs`. No test runner and no dependencies:
+ * this file stands up a mock backend and a mock GitHub API, spawns
+ * `src/main.mjs` as a real child process with an Actions-shaped
+ * environment, and asserts on the four things a consumer actually
+ * experiences - the exit code, the values written to $GITHUB_OUTPUT,
+ * the job-summary markdown, and the exact comment body posted.
+ *
+ * Scenario 5 is the one worth reading first: a backend that reports
+ * `passed: true` with a wall warning must still fail the build, because
+ * a clean score on a bot-detection interstitial is not a clean site.
+ */
+import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// Defaults to the repository this file ships in, so `node test/e2e.mjs`
+// just works; an explicit path is accepted for local experiments.
+const ACTION = process.argv[2] || fileURLToPath(new URL('..', import.meta.url));
+
+let scenario = {};
+const captured = { comments: [], patches: [], patchUrls: [], scanBodies: [] };
+
+const backend = createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', async () => {
+    const body = Buffer.concat(chunks).toString('utf8');
+
+    // --- mock GitHub API ---
+    // The workflow token cannot read /user; a PAT can.
+    if (req.url === '/user' && req.method === 'GET') {
+      res.writeHead(scenario.tokenUser ? 200 : 403, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(scenario.tokenUser
+        ? { login: scenario.tokenUser }
+        : { message: 'Resource not accessible by integration' }));
+      return;
+    }
+    if (req.url.match(/\/issues\/comments\/\d+$/) && req.method === 'PATCH') {
+      captured.patchUrls.push(req.url);
+      captured.patches.push(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 1 }));
+      return;
+    }
+    if (req.url.includes('/issues/') && req.url.includes('/comments')) {
+      if (req.method === 'GET') {
+        res.writeHead(scenario.commentListStatus ?? 200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(scenario.existingComments ?? []));
+        return;
+      }
+      captured.comments.push(JSON.parse(body));
+      res.writeHead(201, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ id: 1 }));
+      return;
+    }
+    // --- mock scan endpoint ---
+    if (req.url === '/api/ci/scan') {
+      const parsed = JSON.parse(body);
+      captured.scanBodies.push({ payload: parsed, headers: req.headers });
+      if (scenario.failFor && parsed.url.includes(scenario.failFor)) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ detail: 'URL blocked: host is not reachable' }));
+        return;
+      }
+      if (scenario.status === 402) {
+        res.writeHead(402, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ detail: 'Monthly CI scan allowance exhausted (1000/1000 on the starter plan). It resets at your next billing cycle. Upgrade at https://www.accessibilitypro.app/pricing' }));
+        return;
+      }
+      if (scenario.status === 422) {
+        res.writeHead(422, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ detail: `Blocked by sign-in: ${parsed.url} did not show its page to the scanner (Cloudflare Access sign-in page). Nothing was graded.` }));
+        return;
+      }
+      if (scenario.status === 401) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ detail: 'This accessibility-pro-token was revoked. Create a new one at https://www.accessibilitypro.app/account#api-tokens.' }));
+        return;
+      }
+      if (scenario.status === 429) {
+        res.writeHead(429, { 'retry-after': '3600', 'content-type': 'application/json' });
+        res.end(JSON.stringify(scenario.body ?? { error: 'Rate limit exceeded', retry_after: 3600 }));
+        return;
+      }
+      if (scenario.delayMs) await new Promise((r) => setTimeout(r, scenario.delayMs));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(scenario.response(parsed.url)));
+      return;
+    }
+    res.writeHead(404);
+    res.end('nope');
+  });
+});
+
+await new Promise((r) => backend.listen(0, '127.0.0.1', r));
+const port = backend.address().port;
+const base = `http://127.0.0.1:${port}`;
+
+function scanResult(url, overrides = {}) {
+  return {
+    id: overrides.id ?? '11111111-2222-3333-4444-555555555555',
+    scan_id: overrides.id ?? '11111111-2222-3333-4444-555555555555',
+    url,
+    wcag_level: 'AA',
+    passed: overrides.passed ?? true,
+    exit_code: overrides.passed === false ? 1 : 0,
+    score: overrides.score ?? 92,
+    scan_duration_ms: 41000,
+    engines_run: ['axe-core', 'pa11y', 'lighthouse'],
+    issues: overrides.issues ?? [],
+    manual_review: overrides.manual_review ?? [],
+    warnings: overrides.warnings ?? [],
+    summary_text: overrides.summary_text ?? (overrides.passed === false ? 'FAILED: critical violations (2) exceed threshold (0)' : 'PASSED'),
+    gate_excluded_framework_managed: overrides.gateExcluded ?? 0,
+    ...('gate_ignored' in overrides
+      ? { gate_ignored: overrides.gate_ignored, ignore_rules_unmatched: overrides.ignore_rules_unmatched ?? [] }
+      : {}),
+    ...('dismissals_applied' in overrides ? { dismissals_applied: overrides.dismissals_applied } : {}),
+    truncation: overrides.truncation ?? undefined,
+    summary: {
+      total_issues: (overrides.issues ?? []).length,
+      manual_review_count: (overrides.manual_review ?? []).length,
+      severity_counts: overrides.counts ?? { critical: 0, high: 0, medium: 0, low: 0 },
+      engines_used: overrides.engines_used ?? ['axe-core', 'pa11y', 'lighthouse'],
+      tested_criteria: [],
+      coverage: [],
+      status_text: 'PASSED',
+    },
+    // Reports are private to their owner; the backend mints a share
+    // token at insert so the PR-comment link opens for a signed-out
+    // reader. `in` rather than `??` because scenario [28] overrides this
+    // to null on purpose, and `null ?? default` would hand back the
+    // default and quietly test nothing.
+    share_token: 'share_token' in overrides
+      ? overrides.share_token
+      : 'tok-e2e-share-0123456789',
+    report_url: 'share_token' in overrides && !overrides.share_token
+      ? null
+      : '/report/11111111-2222-3333-4444-555555555555?s=tok-e2e-share-0123456789',
+  };
+}
+
+const RICH_ISSUE = {
+  id: 'aria_70',
+  rule_id: 'color-contrast',
+  dedup_key: 'color-contrast:1.4.3:.btn',
+  title: 'Text has insufficient contrast — em dash test',
+  description: 'Element has insufficient colour contrast of 2.79:1 | pipe test <b>html</b>',
+  severity: 'critical',
+  wcag: '1.4.3',
+  source_engine: 'axe-core',
+  evidence_level: 'pixel-verified',
+  confidence_bucket: 'high',
+  legal_risk_tier: 1,
+  impact_score: 88,
+  occurrences: 9,
+  occurrence_selectors: ['.btn.primary', '.btn.secondary'],
+  location: '.btn.primary',
+  element_tag: 'button',
+  accessible_name: 'Sign up',
+  contrast_ratio: 2.79,
+  contrast_required: 4.5,
+  fixability_minutes: 5,
+  help_url: 'https://dequeuniversity.com/rules/axe/4.10/color-contrast',
+  llm_rationale: 'The button label fails at 2.79:1 against its background.',
+  llm_rationale_source: 'claude',
+};
+
+const FRAMEWORK_ISSUE = {
+  id: 'x2',
+  rule_id: 'aria-valid-attr-value',
+  title: 'aria-controls | points to <missing> element',
+  description: 'Portal id | is created at <b>open</b> time.',
+  severity: 'high',
+  wcag: '4.1.2',
+  source_engine: 'axe-core',
+  evidence_level: 'single-engine',
+  confidence_bucket: 'medium',
+  impact_score: 40,
+  framework_managed: 'radix-portal',
+  framework_name: 'Radix',
+  location: '[aria-controls="radix-:r7:"]',
+};
+
+function run(env, { inputs }) {
+  const dir = mkdtempSync(join(tmpdir(), 'apscan-'));
+  const outputFile = join(dir, 'output.txt');
+  const summaryFile = join(dir, 'summary.md');
+  const eventFile = join(dir, 'event.json');
+  writeFileSync(outputFile, '');
+  writeFileSync(summaryFile, '');
+  writeFileSync(eventFile, JSON.stringify({ pull_request: { number: 42 } }));
+
+  const childEnv = {
+    PATH: process.env.PATH,
+    SystemRoot: process.env.SystemRoot,
+    GITHUB_OUTPUT: outputFile,
+    GITHUB_STEP_SUMMARY: summaryFile,
+    GITHUB_EVENT_PATH: eventFile,
+    GITHUB_REPOSITORY: 'acme/widgets',
+    GITHUB_SHA: 'abcdef1234567890',
+    GITHUB_API_URL: base,
+    GITHUB_ACTION_REF: 'v2',
+    INPUT_URL: inputs.url,
+    'INPUT_BACKEND-URL': base,
+    'INPUT_REPORT-DOMAIN': 'https://www.accessibilitypro.app',
+    'INPUT_GITHUB-TOKEN': 'ghs_faketoken',
+    ...env,
+  };
+
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [join(ACTION, 'src', 'main.mjs')], {
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => (stdout += d));
+    child.stderr.on('data', (d) => (stderr += d));
+    child.on('close', (code) => {
+      const outputs = {};
+      const raw = readFileSync(outputFile, 'utf8').split('\n');
+      for (let i = 0; i < raw.length; i++) {
+        const m = raw[i].match(/^([a-z-]+)<<(ghadelimiter_.+)$/);
+        if (!m) continue;
+        const lines = [];
+        for (let j = i + 1; j < raw.length && raw[j] !== m[2]; j++) lines.push(raw[j]);
+        outputs[m[1]] = lines.join('\n');
+      }
+      resolve({
+        code,
+        stdout,
+        stderr,
+        outputs,
+        summary: readFileSync(summaryFile, 'utf8'),
+        dir,
+      });
+    });
+  });
+}
+
+let failures = 0;
+function check(name, condition, detail = '') {
+  if (condition) {
+    console.log(`  PASS  ${name}`);
+  } else {
+    failures++;
+    console.log(`  FAIL  ${name}${detail ? `\n        ${detail}` : ''}`);
+  }
+}
+
+// ---------------------------------------------------------------- 1
+console.log('\n[1] Clean scan, no findings');
+scenario = { response: (u) => scanResult(u) };
+captured.comments = [];
+let r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 0', r.code === 0, `code=${r.code}\n${r.stderr}`);
+check('passed output true', r.outputs.passed === 'true', JSON.stringify(r.outputs));
+check('score output', r.outputs.score === '92');
+check('report-url built', r.outputs['report-url'].endsWith('/report/11111111-2222-3333-4444-555555555555?s=tok-e2e-share-0123456789'));
+check('summary rendered', r.summary.includes('✅ Passed') && r.summary.includes('No automatable WCAG AA violations'));
+check('sticky comment posted', captured.comments.length === 1);
+check('comment carries marker', (captured.comments[0]?.body || '').includes('<!-- accessibility-pro-action -->'));
+
+// ---------------------------------------------------------------- 2
+console.log('\n[2] Gate thresholds sent to backend, not recomputed');
+check('thresholds in payload', JSON.stringify(captured.scanBodies.at(-1).payload.thresholds) === '{"critical":0,"high":0,"medium":1000000,"low":1000000}', JSON.stringify(captured.scanBodies.at(-1).payload));
+check('wcag flags false for fail-on=error', captured.scanBodies.at(-1).payload.fail_on_wcag_a === false);
+check('legacy repo header sent', captured.scanBodies.at(-1).headers['x-github-repository'] === 'acme/widgets');
+
+// ---------------------------------------------------------------- 3
+console.log('\n[3] fail-on: wcag maps to the criterion gate');
+scenario = { response: (u) => scanResult(u) };
+await run({ 'INPUT_FAIL-ON': 'wcag' }, { inputs: { url: 'https://example.com' } });
+const wcagPayload = captured.scanBodies.at(-1).payload;
+check('wcag A gate on', wcagPayload.fail_on_wcag_a === true);
+check('wcag AA gate on', wcagPayload.fail_on_wcag_aa === true);
+check('severity thresholds unlimited', wcagPayload.thresholds.critical === 1000000);
+
+// ---------------------------------------------------------------- 4
+console.log('\n[4] Backend says failed -> build fails, reason surfaced');
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      passed: false,
+      score: 41,
+      counts: { critical: 2, high: 1, medium: 0, low: 0 },
+      issues: [RICH_ISSUE, FRAMEWORK_ISSUE],
+      manual_review: [{ title: 'unverifiable' }],
+      gateExcluded: 1,
+      truncation: { hidden_count: 12, raw_count: 30, kept_count: 18 },
+    }),
+};
+captured.comments = [];
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 1', r.code === 1, `code=${r.code}`);
+check('passed output false', r.outputs.passed === 'false');
+check('critical count', r.outputs['violations-critical'] === '2');
+check('manual review count', r.outputs['manual-review-count'] === '1');
+check('fail reason in log', r.stdout.includes('exceed threshold') || r.stderr.includes('exceed threshold'), r.stdout.slice(-800));
+const body4 = captured.comments[0]?.body || '';
+check('comment shows failure headline', body4.includes('❌ Accessibility Pro: build gate failed'));
+check('em dashes scrubbed', !body4.includes('—'), body4.match(/.{0,40}—.{0,40}/)?.[0]);
+check('pipe escaped in title', body4.includes('\\|'));
+check('html angle brackets escaped', body4.includes('&lt;b&gt;'));
+check('evidence chip', body4.includes('pixel-verified'));
+check('tier-1 chip', body4.includes('Tier-1 legal risk'));
+check('contrast numbers', body4.includes('measured 2.79:1, required 4.5:1'));
+check('element line', body4.includes('button "Sign up"'));
+check('AI provenance label', body4.includes('_AI analysis:_'));
+check('needs-review disclosure', body4.includes('#needs-review'));
+check('framework exclusion disclosure', body4.includes('do not gate the build') || body4.includes('does not gate the build'));
+check('truncation disclosure', body4.includes('12 repeat occurrences'));
+check('annotations emitted', r.stdout.includes('::error title=') , r.stdout.slice(0, 400));
+
+// ---------------------------------------------------------------- 5
+console.log('\n[5] Wall warning: a clean score on an interstitial is not a pass');
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      passed: true,
+      score: 96,
+      warnings: [
+        {
+          kind: 'wall_detected',
+          severity: 'warning',
+          message: 'https://example.com appears to be showing a bot-detection challenge instead of its real content.',
+        },
+      ],
+    }),
+};
+captured.comments = [];
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 1 despite backend pass', r.code === 1, `code=${r.code}`);
+check('warnings-count output', r.outputs['warnings-count'] === '1');
+check('reason names the wall', r.stdout.includes('wall_detected') || r.stderr.includes('wall_detected'));
+check('comment headline says not representative', (captured.comments[0]?.body || '').includes('not representative'));
+
+// ---------------------------------------------------------------- 6
+console.log('\n[6] fail-on-unrepresentative: false downgrades it to advisory');
+r = await run({ 'INPUT_FAIL-ON-UNREPRESENTATIVE': 'false' }, { inputs: { url: 'https://example.com' } });
+check('exit 0', r.code === 0, `code=${r.code}\n${r.stderr}`);
+check('warning still rendered', r.summary.includes('may not reflect the real page'));
+
+// ---------------------------------------------------------------- 7
+console.log('\n[7] filter_chain_failed uses `type`, not `kind` — must still block');
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      warnings: [
+        { type: 'filter_chain_failed', severity: 'warning', message: 'False-positive filtering did not complete on this scan.' },
+      ],
+    }),
+};
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 1', r.code === 1, `code=${r.code}`);
+check('title resolved from `type`', r.summary.includes('False-positive filtering did not run'), r.summary.slice(0, 600));
+
+// ---------------------------------------------------------------- 8
+console.log('\n[8] claude_unavailable is info — must NOT block');
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      warnings: [{ kind: 'claude_unavailable', severity: 'info', message: 'AI rationale unavailable.' }],
+    }),
+};
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 0', r.code === 0, `code=${r.code}\n${r.stderr}`);
+check('info warning rendered', r.summary.includes('AI rationale and Copy-as-PR were unavailable'));
+
+// ---------------------------------------------------------------- 9
+console.log('\n[9] Multiple URLs in one step');
+let n = 0;
+scenario = {
+  response: (u) => {
+    n++;
+    return scanResult(u, { id: `id-${n}`, score: n === 1 ? 88 : 55, counts: { critical: n, high: 0, medium: 0, low: 0 } });
+  },
+};
+captured.comments = [];
+r = await run({}, { inputs: { url: 'https://a.example.com\nhttps://b.example.com' } });
+check('exit 0', r.code === 0, `code=${r.code}\n${r.stderr}`);
+check('counts summed', r.outputs['violations-critical'] === '3', r.outputs['violations-critical']);
+check('score is the worst', r.outputs.score === '55');
+check('scan-id is the worst page', r.outputs['scan-id'] === 'id-2');
+check('both URLs in the comment', (captured.comments[0]?.body || '').includes('a.example.com') && (captured.comments[0]?.body || '').includes('b.example.com'));
+
+// --------------------------------------------------------------- 10
+console.log('\n[10] SARIF + results file');
+scenario = { response: (u) => scanResult(u, { issues: [RICH_ISSUE, FRAMEWORK_ISSUE], counts: { critical: 1, high: 1, medium: 0, low: 0 } }) };
+const outDir = mkdtempSync(join(tmpdir(), 'apsarif-'));
+r = await run(
+  { 'INPUT_SARIF-FILE': join(outDir, 'a11y.sarif'), 'INPUT_RESULTS-FILE': join(outDir, 'raw.json') },
+  { inputs: { url: 'https://example.com' } }
+);
+check('exit 0', r.code === 0, r.stderr);
+const sarifPath = join(outDir, 'a11y.sarif');
+check('sarif written', existsSync(sarifPath));
+const sarif = JSON.parse(readFileSync(sarifPath, 'utf8'));
+check('sarif version', sarif.version === '2.1.0');
+check('one run', sarif.runs.length === 1);
+check('rules deduped', sarif.runs[0].tool.driver.rules.length === 2);
+check('critical maps to error', sarif.runs[0].results[0].level === 'error');
+check('fingerprint uses dedup_key', sarif.runs[0].results[0].partialFingerprints.fingerprint === 'color-contrast:1.4.3:.btn');
+check('region present for code scanning', sarif.runs[0].results[0].locations[0].physicalLocation.region.startLine === 1);
+// Code scanning refused "https" locations, failing every upload that
+// had a finding (v2.4.3 CI). Each location must be repository-relative.
+const sarifUris = sarif.runs[0].results.map((res) => res.locations[0].physicalLocation.artifactLocation.uri);
+check('every location is repository-relative', sarifUris.length > 0 && sarifUris.every((u) => !/^[a-z][a-z0-9+.-]*:/i.test(u)), JSON.stringify(sarifUris));
+check('location is the page host and path', sarifUris[0] === 'example.com', sarifUris[0]);
+check('full address kept as page_url', sarif.runs[0].results[0].properties.page_url.startsWith('https://example.com'), sarif.runs[0].results[0].properties.page_url);
+check('sarif-file output set', r.outputs['sarif-file'].endsWith('a11y.sarif'));
+check('results file written', existsSync(join(outDir, 'raw.json')));
+
+// --------------------------------------------------------------- 11
+console.log('\n[11] Rate limit gives an actionable message, not a stack trace');
+scenario = { status: 429, response: (u) => scanResult(u) };
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 1', r.code === 1);
+check('mentions quota + token remedy', r.stdout.includes('quota exhausted') && r.stdout.includes('accessibility-pro-token'), r.stdout.slice(-500));
+check('no stack trace leaked', !r.stdout.includes('at async'));
+
+console.log("\n[11a] The per-address cap fails with the backend's reason, not the repository quota text");
+scenario = {
+  status: 429,
+  body: { detail: 'Too many scans from this address today. Add an accessibility-pro-token, or use the OIDC recipe in the Action README, to get your own allowance.' },
+  response: (u) => scanResult(u),
+};
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 1', r.code === 1);
+check("prints the backend's reason", r.stdout.includes('Too many scans from this address today') && r.stdout.includes('OIDC recipe'), r.stdout.slice(-500));
+check('does not blame the repository quota', !r.stdout.includes('quota exhausted for this repository'), r.stdout.slice(-500));
+check('says when to retry', r.stdout.includes('about 60 minutes'), r.stdout.slice(-500));
+
+console.log("\n[11b] A rejected token fails with the backend's reason");
+scenario = { status: 401, response: (u) => scanResult(u) };
+r = await run({ 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'apt_revokedrevokedrevokedrevokedrevokedrevoked0' }, { inputs: { url: 'https://example.com' } });
+check('exit 1', r.code === 1);
+check('says it was rejected and why', r.stdout.includes('was rejected (HTTP 401)') && r.stdout.includes('was revoked'), r.stdout.slice(-500));
+check('points at the account page', r.stdout.includes('/account#api-tokens'));
+// `::add-mask::` carries the value by design: it is how the runner learns to mask it.
+check('token value never printed', !r.stdout.split('\n').some((l) => !l.startsWith('::add-mask::') && l.includes('apt_revokedrevoked')));
+
+// --------------------------------------------------------------- 12
+console.log('\n[12] Sticky update reuses the existing comment');
+scenario = {
+  response: (u) => scanResult(u),
+  existingComments: [{ id: 77, user: { login: 'github-actions[bot]' }, body: 'old <!-- accessibility-pro-action --> body' }],
+};
+captured.comments = [];
+captured.patches = [];
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('patched not posted', captured.patches.length === 1 && captured.comments.length === 0, `patches=${captured.patches.length} posts=${captured.comments.length}`);
+check('log says updated', r.stdout.includes('Updated the existing comment'));
+
+// --------------------------------------------------------------- 13
+console.log('\n[13] comment: off and legacy comment-on-pr: false');
+captured.comments = [];
+captured.patches = [];
+scenario = { response: (u) => scanResult(u) };
+await run({ INPUT_COMMENT: 'off' }, { inputs: { url: 'https://example.com' } });
+check('no comment calls', captured.comments.length === 0 && captured.patches.length === 0);
+r = await run({ 'INPUT_COMMENT-ON-PR': 'false' }, { inputs: { url: 'https://example.com' } });
+check('legacy input honoured', captured.comments.length === 0 && captured.patches.length === 0);
+check('deprecation warned', r.stdout.includes('deprecated'));
+
+// --------------------------------------------------------------- 14
+console.log('\n[14] Comment failure never turns a green scan red');
+scenario = { response: (u) => scanResult(u), commentListStatus: 403 };
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 0', r.code === 0, `code=${r.code}\n${r.stderr}`);
+check('permission hint given', r.stdout.includes('pull-requests: write'));
+
+// --------------------------------------------------------------- 15
+console.log('\n[15] Input validation');
+scenario = { response: (u) => scanResult(u) };
+r = await run({ 'INPUT_WCAG-LEVEL': 'AAAA' }, { inputs: { url: 'https://example.com' } });
+check('bad wcag-level rejected', r.code === 1 && r.stdout.includes("must be one of A, AA, AAA"));
+r = await run({ INPUT_THRESHOLDS: '{"critical": -1}' }, { inputs: { url: 'https://example.com' } });
+check('negative threshold rejected', r.code === 1 && r.stdout.includes('non-negative integer'));
+r = await run({ INPUT_THRESHOLDS: '{"blocker": 1}' }, { inputs: { url: 'https://example.com' } });
+check('unknown severity rejected', r.code === 1 && r.stdout.includes("Unknown severity 'blocker'"));
+r = await run({ INPUT_THRESHOLDS: '{"critical": 3, "high": 5}' }, { inputs: { url: 'https://example.com' } });
+check('custom thresholds forwarded', r.code === 0 && captured.scanBodies.at(-1).payload.thresholds.critical === 3 && captured.scanBodies.at(-1).payload.thresholds.high === 5, JSON.stringify(captured.scanBodies.at(-1)?.payload?.thresholds));
+r = await run({ 'INPUT_TIMEOUT-MINUTES': '0' }, { inputs: { url: 'https://example.com' } });
+check('bad timeout rejected', r.code === 1 && r.stdout.includes('between 1 and 60'));
+
+// --------------------------------------------------------------- 16
+console.log('\n[16] engines subset forwarded only when set');
+scenario = { response: (u) => scanResult(u) };
+await run({ INPUT_ENGINES: 'axe-core, pa11y' }, { inputs: { url: 'https://example.com' } });
+check('engines array sent', JSON.stringify(captured.scanBodies.at(-1).payload.engines) === '["axe-core","pa11y"]');
+await run({}, { inputs: { url: 'https://example.com' } });
+check('engines omitted when blank', !('engines' in captured.scanBodies.at(-1).payload));
+
+// --------------------------------------------------------------- 17
+console.log('\n[17] Long-blocking response survives past undici’s 300s header cap');
+scenario = { response: (u) => scanResult(u), delayMs: 1200 };
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('delayed response handled', r.code === 0, r.stderr);
+
+// --------------------------------------------------------------- 18
+console.log('\n[18] A response with no verdict is refused, not defaulted to pass');
+scenario = {
+  response: (u) => {
+    const r = scanResult(u);
+    delete r.passed;
+    return r;
+  },
+};
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 1', r.code === 1, `code=${r.code}`);
+check('names the missing verdict', r.stdout.includes('no pass/fail verdict'), r.stdout.slice(-400));
+
+// --------------------------------------------------------------- 19
+console.log('\n[19] A URL containing a comma is one URL, not two');
+scenario = { response: (u) => scanResult(u) };
+captured.scanBodies.length = 0;
+r = await run({}, { inputs: { url: 'https://example.com/search?ids=1,2,3' } });
+check('exit 0', r.code === 0, r.stderr);
+check('single scan issued', captured.scanBodies.length === 1, `count=${captured.scanBodies.length}`);
+check('url intact', captured.scanBodies[0].payload.url === 'https://example.com/search?ids=1,2,3', captured.scanBodies[0]?.payload?.url);
+
+// --------------------------------------------------------------- 20
+console.log('\n[20] top-issues is validated, and caps the inline list');
+r = await run({ 'INPUT_TOP-ISSUES': 'lots' }, { inputs: { url: 'https://example.com' } });
+check('garbage rejected', r.code === 1 && r.stdout.includes('from 1 to 25'));
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      issues: Array.from({ length: 8 }, (_, i) => ({
+        id: `i${i}`,
+        title: `Finding ${i}`,
+        severity: 'medium',
+        wcag: '1.1.1',
+        impact_score: 100 - i,
+        source_engine: 'axe-core',
+      })),
+      counts: { critical: 0, high: 0, medium: 8, low: 0 },
+    }),
+};
+r = await run({ 'INPUT_TOP-ISSUES': '2' }, { inputs: { url: 'https://example.com' } });
+const listed = r.summary.match(/^\d+\. \*\*Finding/gm) || [];
+check('lists exactly 2', listed.length === 2, listed.join(','));
+check('says how many were omitted', r.summary.includes('6 further findings'), r.summary.slice(-900));
+check('ranked by impact', r.summary.includes('Finding 0') && !r.summary.includes('Finding 7'));
+
+// --------------------------------------------------------------- 21
+console.log('\n[21] One bad URL in a multi-URL run does not discard the others');
+let seen = 0;
+scenario = {
+  failFor: 'broken',
+  response: (u) => scanResult(u, { id: `ok-${++seen}` }),
+};
+captured.comments = [];
+r = await run({}, { inputs: { url: 'https://ok.example.com\nhttps://broken.example.com' } });
+check('exit 1', r.code === 1, `code=${r.code}`);
+check('names the unscanned URL', r.stdout.includes('broken.example.com'), r.stdout.slice(-500));
+check('good URL still reported', r.summary.includes('ok.example.com'), r.summary.slice(0, 400));
+check('good URL still commented', (captured.comments[0]?.body || '').includes('ok.example.com'));
+
+// --------------------------------------------------------------- 22
+console.log('\n[22] Every URL failing surfaces the error, not an empty summary');
+scenario = { failFor: 'broken', response: (u) => scanResult(u) };
+r = await run({}, { inputs: { url: 'https://broken.example.com' } });
+check('exit 1', r.code === 1);
+check('no empty scan summary written', !r.summary.includes('| Critical |'), r.summary);
+
+// --------------------------------------------------------------- 23
+console.log('\n[23] Authenticated run surfaces the plan allowance');
+scenario = {
+  response: (u) => ({
+    ...scanResult(u),
+    quota: {
+      tier: 'professional',
+      ci_scans_used: 120,
+      ci_scans_limit: 5000,
+      ci_scans_remaining: 4880,
+      unlimited: false,
+    },
+  }),
+};
+captured.comments = [];
+r = await run({ 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'tok_abc' }, { inputs: { url: 'https://example.com' } });
+check('exit 0', r.code === 0, r.stderr);
+check('plan-tier output', r.outputs['plan-tier'] === 'professional', r.outputs['plan-tier']);
+check('remaining output', r.outputs['ci-scans-remaining'] === '4880', r.outputs['ci-scans-remaining']);
+check('bearer token sent', captured.scanBodies.at(-1).headers.authorization === 'Bearer tok_abc');
+check('comment shows the plan', (captured.comments[0]?.body || '').includes('120 of 5000 CI scans used this month'), (captured.comments[0]?.body || '').slice(-300));
+check('no warning below 90%', !(captured.comments[0]?.body || '').includes('CI scans used this month ⚠️'));
+
+// --------------------------------------------------------------- 24
+console.log('\n[24] Near the allowance, the comment warns');
+scenario = {
+  response: (u) => ({
+    ...scanResult(u),
+    quota: { tier: 'starter', ci_scans_used: 960, ci_scans_limit: 1000, ci_scans_remaining: 40, unlimited: false },
+  }),
+};
+captured.comments = [];
+await run({ 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'tok_abc' }, { inputs: { url: 'https://example.com' } });
+check('warning rendered at 96%', (captured.comments[0]?.body || '').includes('⚠️'), (captured.comments[0]?.body || '').slice(-300));
+
+// --------------------------------------------------------------- 25
+console.log('\n[25] Anonymous runs claim no allowance at all');
+scenario = { response: (u) => scanResult(u) };
+captured.comments = [];
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('plan-tier empty', r.outputs['plan-tier'] === '', JSON.stringify(r.outputs['plan-tier']));
+check('remaining empty, not 0', r.outputs['ci-scans-remaining'] === '', JSON.stringify(r.outputs['ci-scans-remaining']));
+check('no plan line in comment', !(captured.comments[0]?.body || '').includes('CI scans used'));
+
+// --------------------------------------------------------------- 26
+console.log('\n[26] Exhausted allowance is a distinct, actionable failure');
+scenario = { status: 402, response: (u) => scanResult(u) };
+r = await run({ 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'tok_abc' }, { inputs: { url: 'https://example.com' } });
+check('exit 1', r.code === 1);
+check('quotes the backend message', r.stdout.includes('Monthly CI scan allowance exhausted'), r.stdout.slice(-400));
+check('not confused with a rate limit', !r.stdout.includes('resets in about'));
+
+// --------------------------------------------------------------- 27
+console.log('\n[27] The announced version is the version being released');
+// v2.1.1 shipped announcing itself as 2.1.0: the constant is hand-kept
+// and nothing compared it to the changelog. It reaches users twice —
+// the run banner and the SARIF tool version code scanning files a
+// finding under — so a stale one misattributes findings to a release
+// that never contained them.
+{
+  const mainSrc = readFileSync(new URL('../src/main.mjs', import.meta.url), 'utf8');
+  const declared = mainSrc.match(/const ACTION_VERSION = '([^']+)'/)?.[1];
+  const changelog = readFileSync(new URL('../CHANGELOG.md', import.meta.url), 'utf8');
+  const newest = changelog.match(/^## \[(\d+\.\d+\.\d+)\]/m)?.[1];
+  check('ACTION_VERSION parsed', Boolean(declared), String(declared));
+  check('newest CHANGELOG version parsed', Boolean(newest), String(newest));
+  check(`ACTION_VERSION (${declared}) matches the newest CHANGELOG entry (${newest})`, declared === newest);
+
+  scenario = { response: (u) => scanResult(u) };
+  r = await run({}, { inputs: { url: 'https://example.com' } });
+  check('the banner announces it', r.stdout.includes(`Accessibility Pro Scan v${declared}`), r.stdout.slice(0, 200));
+
+  const versionSarif = join(outDir, 'version.sarif');
+  await run(
+    { 'INPUT_SARIF-FILE': versionSarif },
+    { inputs: { url: 'https://example.com' } }
+  );
+  const toolVersion = JSON.parse(readFileSync(versionSarif, 'utf8')).runs[0].tool.driver.version;
+  check(`SARIF tool version is ${declared}`, toolVersion === declared, String(toolVersion));
+}
+
+// --------------------------------------------------------------- 28
+console.log('\n[28] A report with no share token is not linked at all');
+// Reports are private to their owner (2026-09-08). The backend returns
+// share_token: null only when the scans row failed to persist - there is
+// then nothing behind the URL, so linking to it would put a guaranteed
+// 404 in a PR comment.
+scenario = { response: (u) => scanResult(u, { share_token: null }) };
+captured.comments = [];
+r = await run({}, { inputs: { url: 'https://example.com' } });
+check('exit 0', r.code === 0, `code=${r.code}\n${r.stderr}`);
+check('report-url empty', r.outputs['report-url'] === '', JSON.stringify(r.outputs['report-url']));
+check('no bare id link in the comment', !(captured.comments[0]?.body || '').includes('/report/11111111'), captured.comments[0]?.body?.slice(0, 400));
+check('no bare id link in the log', !r.stdout.includes('/report/11111111'), r.stdout.slice(-400));
+
+// --------------------------------------------------------------- 29
+console.log('\n[29] In-house analyzers are not counted as engines');
+// `engines_used` also lists Accessibility Pro's own analyzers. Counting
+// them made the header read "8 engines" beside a hosted report that says
+// "5 of 5 engines"; the report split the two on 2026-09-08 and the action
+// did not until 2.2.0.
+scenario = {
+  response: (u) => scanResult(u, {
+    engines_used: [
+      'axe-core', 'ibm-equal-access', 'arc-style', 'pa11y', 'lighthouse',
+      'wcag-checks', 'mobile-accessibility', 'focus-graph',
+    ],
+  }),
+};
+captured.comments = [];
+await run({}, { inputs: { url: 'https://example.com' } });
+{
+  const body = captured.comments[0]?.body || '';
+  check('five engines and three analyzers', body.includes('5 of 5 engines + 3 in-house analyzers'), body.slice(0, 400));
+  check('never "8 engines"', !body.includes('8 engines'));
+}
+scenario = { response: (u) => scanResult(u) };
+captured.comments = [];
+await run({}, { inputs: { url: 'https://example.com' } });
+check('a subset reads as a subset', (captured.comments[0]?.body || '').includes('3 of 5 engines'), (captured.comments[0]?.body || '').slice(0, 400));
+
+// --------------------------------------------------------------- 30
+console.log('\n[30] Sticky mode only reuses a comment this token wrote (F23)');
+{
+  const MARKER_BODY = 'build gate passed <!-- accessibility-pro-action -->';
+  scenario = {
+    response: (u) => scanResult(u),
+    existingComments: [
+      { id: 5, user: { login: 'mallory' }, body: MARKER_BODY },
+      { id: 77, user: { login: 'github-actions[bot]' }, body: `old ${MARKER_BODY}` },
+    ],
+  };
+  captured.comments = [];
+  captured.patches = [];
+  captured.patchUrls = [];
+  await run({}, { inputs: { url: 'https://example.com' } });
+  check('the planted comment is never edited', !captured.patchUrls.some((u) => u.endsWith('/comments/5')), captured.patchUrls.join(','));
+  check('the bot comment is updated instead', captured.patchUrls.length === 1 && captured.patchUrls[0].endsWith('/comments/77'), captured.patchUrls.join(','));
+
+  scenario = { response: (u) => scanResult(u), existingComments: [{ id: 5, user: { login: 'mallory' }, body: MARKER_BODY }] };
+  captured.comments = [];
+  captured.patchUrls = [];
+  await run({}, { inputs: { url: 'https://example.com' } });
+  check('only a planted comment: post a fresh one', captured.patchUrls.length === 0 && captured.comments.length === 1, `patches=${captured.patchUrls.length} posts=${captured.comments.length}`);
+
+  scenario = {
+    response: (u) => scanResult(u),
+    tokenUser: 'alice',
+    existingComments: [
+      { id: 6, user: { login: 'github-actions[bot]' }, body: MARKER_BODY },
+      { id: 9, user: { login: 'alice' }, body: MARKER_BODY },
+    ],
+  };
+  captured.comments = [];
+  captured.patchUrls = [];
+  await run({}, { inputs: { url: 'https://example.com' } });
+  check('a PAT reuses its own user\'s comment', captured.patchUrls.length === 1 && captured.patchUrls[0].endsWith('/comments/9'), captured.patchUrls.join(','));
+}
+
+// --------------------------------------------------------------- 31
+console.log('\n[31] Credentials in the scanned URL are never published (F6)');
+{
+  const SECRET_URL = 'https://preview-user:S3cr3t%2Fpass@staging.acme.test/app?x-vercel-protection-bypass=BYPASS-TOKEN-123#t=FRAG-SECRET';
+  const SECRETS = ['preview-user', 'S3cr3t', 'BYPASS-TOKEN-123', 'FRAG-SECRET'];
+  const leaks = (text) => SECRETS.filter((s) => text.includes(s));
+  // `::add-mask::` lines are how a value gets masked; they carry it by design.
+  const logWithoutMaskCommands = (out) => out.split('\n').filter((l) => !l.startsWith('::add-mask::')).join('\n');
+  const HELP = 'https://dequeuniversity.com/rules/axe/4.10/color-contrast?application=axeAPI';
+  scenario = {
+    response: (u) => scanResult(u, {
+      passed: false,
+      counts: { critical: 1, high: 0, medium: 0, low: 0 },
+      issues: [{ ...RICH_ISSUE, help_url: HELP, source_url: u, description: `Seen on ${u} after load` }],
+    }),
+  };
+  captured.comments = [];
+  captured.scanBodies = [];
+  const dir31 = mkdtempSync(join(tmpdir(), 'apf6-'));
+  r = await run(
+    { 'INPUT_SARIF-FILE': join(dir31, 'a.sarif'), 'INPUT_RESULTS-FILE': join(dir31, 'raw.json') },
+    { inputs: { url: SECRET_URL } }
+  );
+  const body = captured.comments[0]?.body || '';
+  check('the backend still receives the real URL', captured.scanBodies.at(-1)?.payload.url === SECRET_URL);
+  check('comment carries no credential', body.length > 0 && leaks(body).length === 0, leaks(body).join(','));
+  check('comment still names the page', body.includes('https://***@staging.acme.test/app?***#***'), body.slice(0, 300));
+  check('job summary carries no credential', leaks(r.summary).length === 0, leaks(r.summary).join(','));
+  const sarifText = readFileSync(join(dir31, 'a.sarif'), 'utf8');
+  check('SARIF carries no credential', leaks(sarifText).length === 0, leaks(sarifText).join(','));
+  check('a rule help link on another host is untouched', sarifText.includes(HELP));
+  const rawText = readFileSync(join(dir31, 'raw.json'), 'utf8');
+  check('results file carries no credential', leaks(rawText).length === 0, leaks(rawText).join(','));
+  const log = logWithoutMaskCommands(r.stdout);
+  check('log and annotations carry no credential', leaks(log).length === 0, leaks(log).join(','));
+  // Workflow commands escape `%` as `%25`; the runner decodes it again.
+  check('the URL and its password are masked', r.stdout.includes(`::add-mask::${SECRET_URL.replace(/%/g, '%25')}`) && r.stdout.includes('::add-mask::S3cr3t/pass'));
+
+  scenario = { failFor: 'staging.acme.test', response: (u) => scanResult(u) };
+  r = await run({}, { inputs: { url: `${SECRET_URL}\nhttps://example.com` } });
+  const failLog = logWithoutMaskCommands(r.stdout);
+  check('a failed scan names the page', failLog.includes('https://***@staging.acme.test/app?***#***'), failLog.slice(-600));
+  check('a failed scan carries no credential', leaks(failLog).length === 0 && leaks(r.summary).length === 0, leaks(failLog).join(','));
+}
+
+// Plain URLs are shown exactly as before.
+scenario = { response: (u) => scanResult(u) };
+captured.comments = [];
+r = await run({}, { inputs: { url: 'https://example.com/pricing' } });
+check('a URL with nothing to redact is unchanged', (captured.comments[0]?.body || '').includes('https://example.com/pricing') && !r.stdout.includes('::add-mask::https://example.com'));
+
+// ---------------------------------------------------------------- 37
+console.log('\n[37] ignore-rules: acknowledged findings are sent, disclosed, suppressed, not annotated');
+const IGNORED_ISSUE = {
+  id: 'ibm-input_checkboxes_grouped-32ccc7c1',
+  rule_id: 'ibm-input_checkboxes_grouped',
+  title: 'Checkbox input and others with the name "consent" are not grouped together',
+  description: 'IBM groups same-named checkboxes across the page.',
+  severity: 'high',
+  wcag: '1.3.1',
+  source_engine: 'ibm-equal-access',
+  evidence_level: 'single-engine',
+  confidence_bucket: 'medium',
+  impact_score: 40,
+  location: 'form#enquiry input[name=consent]',
+  gate_ignored: 'ibm-input_checkboxes_grouped',
+};
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      passed: true,
+      score: 89,
+      issues: [IGNORED_ISSUE],
+      gate_ignored: 1,
+      ignore_rules_unmatched: ['no-such-rule'],
+    }),
+};
+captured.comments = [];
+{
+  const dir37 = mkdtempSync(join(tmpdir(), 'apscan-ignore-'));
+  r = await run(
+    { 'INPUT_IGNORE-RULES': 'ibm-input_checkboxes_grouped\nno-such-rule', 'INPUT_SARIF-FILE': join(dir37, 'a11y.sarif') },
+    { inputs: { url: 'https://example.com/kontakti/' } }
+  );
+  const ignorePayload = captured.scanBodies.at(-1).payload;
+  check('ignore_rules sent to the backend, in order', JSON.stringify(ignorePayload.ignore_rules) === JSON.stringify(['ibm-input_checkboxes_grouped', 'no-such-rule']), JSON.stringify(ignorePayload.ignore_rules));
+  check('exit 0 on the backend verdict', r.code === 0, `code=${r.code}\n${r.stderr.slice(-400)}`);
+  const body37 = captured.comments[0]?.body || '';
+  check('comment discloses the ignored finding', body37.includes('matched ignore-rules and does not gate the build'), body37.slice(0, 800));
+  check('comment names the unmatched entry', body37.includes('matched no finding: no-such-rule'));
+  check('issue chip says ignored', body37.includes('ignored via ignore-rules: ibm-input_checkboxes_grouped'));
+  check('unmatched entry warned in the log', r.stdout.includes('::warning::ignore-rules entry "no-such-rule" matched no finding'), r.stdout.slice(0, 600));
+  check('ignored finding is not annotated', !/::(warning|error) title=WCAG 1\.3\.1/.test(r.stdout), r.stdout.slice(0, 600));
+  const sarif37 = JSON.parse(readFileSync(join(dir37, 'a11y.sarif'), 'utf8'));
+  const res37 = sarif37.runs[0].results[0];
+  check('SARIF result is suppressed, not dropped', res37?.suppressions?.[0]?.kind === 'external' && res37.suppressions[0].justification === 'ignore-rules: ibm-input_checkboxes_grouped', JSON.stringify(res37?.suppressions));
+}
+scenario = { response: (u) => scanResult(u) };
+await run({}, { inputs: { url: 'https://example.com' } });
+check('no ignore-rules input sends no ignore_rules field', !('ignore_rules' in captured.scanBodies.at(-1).payload));
+
+console.log('\n[38] A Cloudflare Access service token reaches the backend and nowhere else');
+scenario = { response: (u) => scanResult(u) };
+{
+  // Not credential-shaped on purpose: the repository's secret scan reads
+  // `const secret = '<entropy>'` in a diff as a leak, and it is right to.
+  const id = 'fixture-client-id.access';
+  const clientSecretFixture = 'fixture-client-secret-value';
+  const before = captured.scanBodies.length;
+  r = await run(
+    { 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'apt_e2etokene2etokene2etokene2etokene2etokene2e0', 'INPUT_CF-ACCESS-CLIENT-ID': id, 'INPUT_CF-ACCESS-CLIENT-SECRET': clientSecretFixture },
+    { inputs: { url: 'https://staging.example.com/' } }
+  );
+  const sent = captured.scanBodies.at(-1);
+  check('one scan request', captured.scanBodies.length === before + 1);
+  check('headers sent in the payload', JSON.stringify(sent.payload.headers) === JSON.stringify({ 'CF-Access-Client-Id': id, 'CF-Access-Client-Secret': clientSecretFixture }), JSON.stringify(sent.payload.headers));
+  check('not sent as request headers to the backend', !Object.keys(sent.headers).some((k) => k.toLowerCase().startsWith('cf-access')));
+  const masked = r.stdout.split('\n').filter((l) => l.startsWith('::add-mask::'));
+  check('both values masked', masked.includes(`::add-mask::${id}`) && masked.includes(`::add-mask::${clientSecretFixture}`), masked.join(' | '));
+  const leaked = r.stdout.split('\n').filter((l) => !l.startsWith('::add-mask::') && (l.includes(clientSecretFixture) || l.includes(id)));
+  check('neither value printed anywhere else', leaked.length === 0, leaked.join('\n'));
+  check('exit 0', r.code === 0, r.stdout.slice(-400));
+}
+
+console.log('\n[39] Half a service token fails before anything is sent');
+{
+  const before = captured.scanBodies.length;
+  r = await run({ 'INPUT_CF-ACCESS-CLIENT-ID': 'only-the-id.access' }, { inputs: { url: 'https://staging.example.com/' } });
+  check('exit 1', r.code === 1);
+  check('says both are needed', r.stdout.includes('Set both `cf-access-client-id` and `cf-access-client-secret`'), r.stdout.slice(-400));
+  check('no scan request made', captured.scanBodies.length === before);
+}
+scenario = { response: (u) => scanResult(u) };
+await run({}, { inputs: { url: 'https://example.com' } });
+check('no service token sends no headers field', !('headers' in captured.scanBodies.at(-1).payload));
+check('read-only left to the backend default: no read_only field', !('read_only' in captured.scanBodies.at(-1).payload));
+
+console.log('\n[39b] read-only: false is the per-scan opt-out, and only false is sent');
+scenario = { response: (u) => scanResult(u) };
+await run({ 'INPUT_READ-ONLY': 'false' }, { inputs: { url: 'https://staging.example.com/' } });
+check('read_only false sent', captured.scanBodies.at(-1).payload.read_only === false, JSON.stringify(captured.scanBodies.at(-1).payload));
+await run({ 'INPUT_READ-ONLY': 'true' }, { inputs: { url: 'https://staging.example.com/' } });
+check('read-only true sends no field', !('read_only' in captured.scanBodies.at(-1).payload));
+{
+  const before = captured.scanBodies.length;
+  r = await run({ 'INPUT_READ-ONLY': 'sometimes' }, { inputs: { url: 'https://staging.example.com/' } });
+  check('a value that is not a boolean fails the step', r.code === 1 && r.stdout.includes("Input 'read-only' must be a boolean"), r.stdout.slice(-300));
+  check('and nothing is scanned', captured.scanBodies.length === before);
+}
+
+console.log('\n[40] Blocked by sign-in fails the step with the scanner\'s reason');
+scenario = { status: 422, response: (u) => scanResult(u) };
+r = await run({}, { inputs: { url: 'https://staging.example.com/' } });
+check('exit 1', r.code === 1);
+check('prints the reason', r.stdout.includes('Blocked by sign-in: https://staging.example.com/ did not show its page'), r.stdout.slice(-600));
+check('not wrapped as a generic HTTP failure', !r.stdout.includes('Scan request failed: HTTP 422'));
+check('not retried', (r.stdout.match(/Retrying in 30s/g) || []).length === 0);
+
+console.log('\n[41] Saved dismissals are told apart from ignore-rules');
+{
+  const CONTRAST_IGNORED = { ...RICH_ISSUE, gate_ignored: 'color-contrast' };
+  // No ignore-rules input: the only acknowledgement is a saved dismissal.
+  scenario = {
+    response: (u) =>
+      scanResult(u, { passed: true, score: 89, issues: [IGNORED_ISSUE], gate_ignored: 1, dismissals_applied: 2 }),
+  };
+  captured.comments = [];
+  const dir41 = mkdtempSync(join(tmpdir(), 'apscan-saved-'));
+  r = await run(
+    { 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'apt_e2etokene2etokene2etokene2etokene2etokene2e0', 'INPUT_SARIF-FILE': join(dir41, 'a11y.sarif') },
+    { inputs: { url: 'https://example.com/kontakti/' } }
+  );
+  const body41 = captured.comments[0]?.body || '';
+  check('exit 0', r.code === 0, `code=${r.code}\n${r.stderr.slice(-400)}`);
+  check('no ignore_rules field sent', !('ignore_rules' in captured.scanBodies.at(-1).payload));
+  check('comment names the saved dismissal', body41.includes('1 finding matched a dismissal saved on your Accessibility Pro account and does not gate the build'), body41.slice(0, 900));
+  check('comment does not claim ignore-rules', !body41.includes('ignore-rules'), body41.slice(0, 900));
+  check('chip says saved dismissal', body41.includes('saved dismissal: ibm-input_checkboxes_grouped'));
+  check('log names the applied dismissals', r.stdout.includes('2 dismissals saved on your account applied to this site; 1 finding matched'), r.stdout.slice(0, 900));
+  check('log does not claim ignore-rules', !r.stdout.includes('through ignore-rules'));
+  check('dismissed finding is not annotated', !/::(warning|error) title=WCAG 1\.3\.1/.test(r.stdout));
+  const res41 = JSON.parse(readFileSync(join(dir41, 'a11y.sarif'), 'utf8')).runs[0].results[0];
+  check('SARIF suppression says saved dismissal', res41?.suppressions?.[0]?.justification === 'saved dismissal: ibm-input_checkboxes_grouped', JSON.stringify(res41?.suppressions));
+  check('SARIF property records the source', res41?.properties?.gate_ignored_source === 'saved', JSON.stringify(res41?.properties));
+
+  // Both at once: each finding keeps its own source.
+  scenario = {
+    response: (u) =>
+      scanResult(u, { passed: true, score: 80, issues: [CONTRAST_IGNORED, IGNORED_ISSUE], gate_ignored: 2, dismissals_applied: 1 }),
+  };
+  captured.comments = [];
+  const dir41b = mkdtempSync(join(tmpdir(), 'apscan-mixed-'));
+  await run(
+    { 'INPUT_IGNORE-RULES': 'color-contrast', 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'apt_e2etokene2etokene2etokene2etokene2etokene2e0', 'INPUT_SARIF-FILE': join(dir41b, 'a11y.sarif') },
+    { inputs: { url: 'https://example.com/' } }
+  );
+  const mixed = captured.comments[0]?.body || '';
+  check('mixed: one counted as ignore-rules', mixed.includes('1 finding matched ignore-rules and does not gate the build'), mixed.slice(0, 1200));
+  check('mixed: one counted as saved', mixed.includes('1 finding matched a dismissal saved on your Accessibility Pro account'));
+  check('mixed: ignore-rules chip on the workflow entry', mixed.includes('ignored via ignore-rules: color-contrast'));
+  check('mixed: saved chip on the stored entry', mixed.includes('saved dismissal: ibm-input_checkboxes_grouped'));
+  const mixedSarif = JSON.parse(readFileSync(join(dir41b, 'a11y.sarif'), 'utf8')).runs[0].results;
+  const justifications = mixedSarif.map((x) => x.suppressions?.[0]?.justification).sort();
+  check('mixed: SARIF justifies each by its source', JSON.stringify(justifications) === JSON.stringify(['ignore-rules: color-contrast', 'saved dismissal: ibm-input_checkboxes_grouped']), JSON.stringify(justifications));
+
+  // An older backend that never sends dismissals_applied reads exactly as before.
+  scenario = {
+    response: (u) => scanResult(u, { passed: true, issues: [CONTRAST_IGNORED], gate_ignored: 1 }),
+  };
+  captured.comments = [];
+  await run({ 'INPUT_IGNORE-RULES': 'color-contrast' }, { inputs: { url: 'https://example.com/' } });
+  const legacy = captured.comments[0]?.body || '';
+  check('older backend: still ignore-rules', legacy.includes('1 finding matched ignore-rules') && !legacy.includes('saved'), legacy.slice(0, 900));
+}
+
+console.log('\n[42] Saved dismissals that could not be read get a real heading and do not fail the build');
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      passed: true,
+      warnings: [{
+        kind: 'dismissals_unavailable',
+        severity: 'warning',
+        message: 'Your saved dismissals for this site could not be read, so none were applied to this run.',
+      }],
+    }),
+};
+captured.comments = [];
+r = await run({ 'INPUT_ACCESSIBILITY-PRO-TOKEN': 'apt_e2etokene2etokene2etokene2etokene2etokene2e0' }, { inputs: { url: 'https://example.com/' } });
+{
+  const body42 = captured.comments[0]?.body || '';
+  check('titled, not a generic notice', body42.includes('**Your saved dismissals could not be applied**') && !body42.includes('Scan notice'), body42.slice(0, 900));
+  check('exit 0: a stricter gate is not an unrepresentative scan', r.code === 0, r.stdout.slice(-400));
+  check('not counted as a blocking warning', r.outputs['warnings-count'] === '0', JSON.stringify(r.outputs['warnings-count']));
+}
+
+console.log('\n[43] ai: false reaches the backend, and the AI-off notice is titled and never blocks');
+scenario = {
+  response: (u) =>
+    scanResult(u, {
+      passed: true,
+      warnings: [{
+        kind: 'ai_off',
+        severity: 'info',
+        message: 'AI off (scan request). No page content from this scan was sent to an AI provider.',
+      }],
+    }),
+};
+captured.comments = [];
+r = await run({ INPUT_AI: 'false' }, { inputs: { url: 'https://example.com/' } });
+{
+  check('ai: false sent to the backend', captured.scanBodies.at(-1).payload.ai === false, JSON.stringify(captured.scanBodies.at(-1).payload));
+  const body43 = captured.comments[0]?.body || '';
+  check('titled, not a generic notice', body43.includes('**AI was not used for this scan**') && !body43.includes('Scan notice'), body43.slice(0, 900));
+  check('names the setting', body43.includes('AI off (scan request)'), body43.slice(0, 900));
+  check('exit 0: AI off is not an unrepresentative scan', r.code === 0, r.stdout.slice(-400));
+  check('not counted as a blocking warning', r.outputs['warnings-count'] === '0', JSON.stringify(r.outputs['warnings-count']));
+}
+scenario = { response: (u) => scanResult(u) };
+await run({}, { inputs: { url: 'https://example.com/' } });
+check('no ai input sends no ai field', !('ai' in captured.scanBodies.at(-1).payload), JSON.stringify(captured.scanBodies.at(-1).payload));
+
+backend.close();
+console.log(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}`);
+process.exit(failures === 0 ? 0 : 1);

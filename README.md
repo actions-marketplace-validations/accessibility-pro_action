@@ -1,96 +1,447 @@
-# Accessibility Pro · GitHub Action
+# Accessibility Pro Scan
 
-Free WCAG 2.2 AA scanner that runs on every PR. Posts an impact-ranked
-comment with a deep link to **Copy as PR**: a validated unified diff
-that resolves the violation without regressions.
+WCAG 2.2 accessibility gate for pull requests. Five engines, live-DOM
+verification, one comment that updates itself, and fixes you can apply.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/accessibility-pro/action/actions/workflows/ci.yml/badge.svg)](https://github.com/accessibility-pro/action/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![accessibilitypro.app](https://img.shields.io/badge/accessibilitypro.app-green)](https://www.accessibilitypro.app)
 
-## Usage
+## Quick start
 
 ```yaml
-# .github/workflows/a11y.yml
-name: Accessibility scan
-on: [pull_request]
+# .github/workflows/accessibility.yml
+name: Accessibility
+on: pull_request
+
+permissions:
+  pull-requests: write   # post the results comment
+  id-token: write        # count free-tier quota against this repo
 
 jobs:
-  a11y:
+  scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: accessibility-pro/action@v1
+      - uses: accessibility-pro/action@v2
         with:
           url: ${{ secrets.STAGING_URL }}
-          wcag-level: AA        # A | AA | AAA
-          fail-on: error        # error | warning | none
-          # Optional: unlocks Team-quota and Copy-as-PR in PR comments
-          accessibility-pro-token: ${{ secrets.ACCESSIBILITY_PRO_TOKEN }}
 ```
 
-> **Pre-publication form**: until `accessibility-pro/action@v1` is live
-> on the Marketplace, you can pin the source repo directly:
+That is the whole setup. No checkout, no `setup-node`, no browser
+install: the scan runs on our infrastructure and the action is a
+dependency-free Node script that talks to it.
+
+Full reference, including exit codes and allow-listing the scanner:
+[accessibilitypro.app/docs/github-action](https://www.accessibilitypro.app/docs/github-action).
+
+## What you get
+
+One comment per pull request, updated in place on every push rather
+than stacked fifteen deep by the time anyone reviews it:
+
+> ## ❌ Accessibility Pro: build gate failed
 >
-> ```yaml
-> - uses: HasanTayem/access-pro-ai/action@main
-> ```
+> ### https://staging.acme.example
 >
-> Both forms call the same code; only the discoverability via
-> Marketplace search differs.
+> Score **41/100** · WCAG AA · 3 findings · 5 engines · 41s
+>
+> | Critical | High | Medium | Low | Needs review |
+> |---:|---:|---:|---:|---:|
+> | 1 | 2 | 0 | 0 | 3 |
+>
+> **Top 3 by impact**
+>
+> 1. **Text has insufficient contrast**
+>    critical · WCAG 1.4.3 · pixel-verified · high confidence · **Tier-1 legal risk** · 9 elements · ~5 min to fix
+>    button "Sign up" at `.btn.primary` · measured 2.79:1, required 4.5:1
+
+Findings are ordered by measured impact, not by the order an engine
+happened to emit them. Each one carries how it was verified, so you can
+tell a pixel-sampled contrast failure from a single engine's guess
+before you spend an afternoon on it.
+
+The same content lands in the job summary, so runs on `push`, `schedule`
+and `workflow_dispatch` are just as readable as pull requests.
+
+## Recipes
+
+### Gate on conformance, not on severity
+
+`fail-on: wcag` fails the build for any Level A or AA success-criterion
+failure, whatever severity it carries. This is the setting for teams
+working to a compliance deadline.
+
+```yaml
+      - uses: accessibility-pro/action@v2
+        with:
+          url: https://staging.acme.example
+          wcag-level: AA
+          fail-on: wcag
+```
+
+### Scan several pages in one step
+
+```yaml
+      - uses: accessibility-pro/action@v2
+        with:
+          url: |
+            https://staging.acme.example/
+            https://staging.acme.example/pricing
+            https://staging.acme.example/checkout
+```
+
+Counts are summed across pages, and `score` / `scan-id` / `report-url`
+describe the worst page, which is the one you want to open first. Each
+page is a separate scan against your quota.
+
+### Track findings in the Security tab
+
+```yaml
+      - uses: accessibility-pro/action@v2
+        id: a11y
+        with:
+          url: https://staging.acme.example
+          sarif-file: a11y.sarif
+          fail-on: none          # let code scanning own the verdict
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: a11y.sarif
+          category: accessibility
+```
+
+Fingerprints match the backend's own baseline keys, so code scanning
+tracks a finding across runs as fixed or reintroduced instead of
+reporting every scan as brand new. Results appear in the Security tab;
+they are not annotated onto source lines, because a URL scan has no
+source file to annotate.
+
+### Pay down a backlog without a red build every day
+
+```yaml
+        with:
+          url: https://staging.acme.example
+          thresholds: '{"critical": 0, "high": 5}'
+```
+
+No new criticals, and no more than five high-severity findings.
+Severities you leave out are unlimited.
+
+### Acknowledge a finding you have reviewed
+
+```yaml
+        with:
+          url: https://www.acme.example/contact
+          fail-on: wcag
+          ignore-rules: |
+            ibm-input_checkboxes_grouped
+            color-contrast@.legal-footnote
+```
+
+Use the rule id as the report or SARIF prints it. A fragment after `@`
+limits the entry to findings whose page URL, location or occurrence
+selector contains it. Ignored findings stay in the report and the score
+and are marked as ignored in the comment; they just stop failing the
+build. An entry that matches nothing is named in the comment and warned
+in the log, so a typo cannot pass a build. This is the fix for "one
+reviewed finding, or drop the whole engine".
+
+Decisions you want to keep across every workflow can be saved on your
+account instead, with `POST /api/account/dismissals` (same entry format,
+keyed on the site's host). Runs that carry `accessibility-pro-token`
+apply them on top of `ignore-rules`, and the comment labels each skipped
+finding by its source: `ignored via ignore-rules` or `saved dismissal`.
+If the saved list cannot be read, the run says so and applies none, so
+the gate is stricter, never looser.
+
+### Use the results in later steps
+
+```yaml
+      - uses: accessibility-pro/action@v2
+        id: a11y
+        with:
+          url: https://staging.acme.example
+          fail-on: none
+
+      - name: Block release below 90
+        if: steps.a11y.outputs.score < 90
+        run: |
+          echo "Score ${{ steps.a11y.outputs.score }}, report ${{ steps.a11y.outputs.report-url }}"
+          exit 1
+```
+
+### Watch production overnight
+
+```yaml
+on:
+  schedule:
+    - cron: '0 6 * * *'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: accessibility-pro/action@v2
+        with:
+          url: https://www.acme.example
+          fail-on: wcag
+```
+
+A scheduled run has no pull request to comment on, so the results go to
+the job summary and the workflow's own failure notification.
+
+### Scan a staging site behind Cloudflare Access
+
+A site behind Cloudflare Access sends the scanner to its sign-in page.
+Give the scanner a service token instead:
+
+1. In Cloudflare Zero Trust, open **Access, Service Auth** and create a
+   service token. Copy its Client ID and Client Secret.
+2. In the Access application for your staging site, add a policy with
+   the action **Service Auth** that includes that token.
+3. Store the two values as repository secrets, `CF_ACCESS_CLIENT_ID` and
+   `CF_ACCESS_CLIENT_SECRET`, and pass them:
+
+```yaml
+      - uses: accessibility-pro/action@v2
+        with:
+          url: https://staging.example.com
+          accessibility-pro-token: ${{ secrets.ACCESSIBILITY_PRO_TOKEN }}
+          cf-access-client-id: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          cf-access-client-secret: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+```
+
+The values are masked in the log and sent as `CF-Access-Client-Id` and
+`CF-Access-Client-Secret` only to the scanned site's own hosts, never to
+a third-party host on the page and never across a redirect. They are not
+stored. Scanning behind a login needs an `accessibility-pro-token` on the
+Developer plan or above. If Access still refuses the token, the step fails
+with "Blocked by sign-in" and says what to check.
 
 ## Inputs
 
 | Input | Default | Description |
-|-------|---------|-------------|
-| `url` | *(required)* | URL to scan. For auth-gated previews, store as a repo secret. |
+|---|---|---|
+| `url` | *(required)* | URL to scan. One per line to scan several. Use a repo secret for auth-gated previews. |
 | `wcag-level` | `AA` | `A`, `AA`, or `AAA`. |
-| `fail-on` | `error` | `error` (critical + high violations fail CI), `warning` (adds medium), or `none`. |
-| `accessibility-pro-token` | `''` | Optional API token. Unlocks Team-quota scans and Copy-as-PR in comments. |
-| `comment-on-pr` | `true` | Post the results as a PR comment on `pull_request` events. |
-| `backend-url` | Prod | Override for the backend API (self-hosted deployments). |
-| `report-domain` | Prod | Override for the hosted-report domain (self-hosted frontend). |
+| `fail-on` | `error` | `error` (critical or high fails), `warning` (adds medium), `wcag` (any Level A/AA criterion failure), `none` (report only). |
+| `thresholds` | `''` | JSON object of per-severity allowances that overrides `fail-on`, e.g. `{"critical": 0, "high": 3}`. |
+| `fail-on-unrepresentative` | `true` | Fail when the scanner could not see the real page. See below. |
+| `ignore-rules` | `''` | Reviewed findings that must not gate the build, one rule id per line, optionally `@` a URL or selector fragment. See below. |
+| `engines` | *(all five)* | Comma-separated subset of `axe-core`, `lighthouse`, `pa11y`, `ibm-equal-access`, `arc-style`. |
+| `ai` | `true` | From 2.5.0. `false` keeps the scan away from every AI provider: no page content is sent to a model, only the plain-language explanations are skipped, and the comment says "AI off (scan request)". An account with AI off on its Account page gets no AI whatever this says, and a scan with the `cf-access-*` inputs uses AI only if the account opted in to AI on signed-in scans. |
+| `comment` | `sticky` | `sticky` updates one comment in place, `new` adds one per run, `off` disables it. |
+| `top-issues` | `5` | Findings listed inline, ranked by impact (1 to 25). |
+| `annotations` | `true` | Emit build-failing findings as workflow annotations. |
+| `sarif-file` | `''` | Path to write a SARIF 2.1.0 report to. |
+| `results-file` | `''` | Path to write the raw scan payload (JSON) to. |
+| `accessibility-pro-token` | `''` | API token. Scans are attributed to your account, appear in your dashboard, and draw on your plan's CI allowance instead of the free tier. |
+| `cf-access-client-id` | `''` | Client ID of a Cloudflare Access service token, for a site behind Access. Use with `cf-access-client-secret`; needs a token on Developer or above. |
+| `cf-access-client-secret` | `''` | Client Secret of the same service token. |
+| `read-only` | `true` | From 2.5.0. A scan that uses the service token is read-only: requests that could change data are blocked and the form error check is skipped. Set `false` for a test site where the scanner may submit forms. |
+| `github-token` | `${{ github.token }}` | Token used to post the comment. |
+| `timeout-minutes` | `15` | Per-attempt budget for one scan request (1 to 60). |
+| `retries` | `1` | Retries for transient backend or network failures (0 to 3). |
+| `backend-url` | Production | Override for self-hosted deployments. |
+| `report-domain` | Production | Override for a self-hosted frontend. |
+| `oidc-audience` | `https://api.accessibilitypro.app` | Audience for the OIDC token. Change only when self-hosting. |
+
+`comment-on-pr` from v1 is still accepted: `comment-on-pr: false`
+behaves as `comment: off` and logs a deprecation notice.
 
 ## Outputs
 
 | Output | Description |
-|--------|-------------|
-| `scan-id` | UUID of the scan; use to build your own deep links. |
-| `score` | Accessibility score (0 to 100). |
-| `violations-critical` | Count of critical-severity violations. |
-| `violations-high` | Count of high-severity violations. |
-| `report-url` | Direct link to the hosted report. |
+|---|---|
+| `passed` | `true` when every scanned URL cleared the gate. |
+| `score` | Score (0 to 100) of the lowest-scoring URL. |
+| `scan-id` | Scan id of the lowest-scoring URL. |
+| `report-url` | Hosted report for the lowest-scoring URL, including its share token. Store the whole URL: the id alone does not open the report. |
+| `violations-critical` / `-high` / `-medium` / `-low` | Counts across every scanned URL. |
+| `total-issues` | Total findings reported as violations. |
+| `manual-review-count` | Findings that need a human look rather than counting as violations. |
+| `warnings-count` | Scan warnings that make the result unrepresentative. |
+| `engines-used` | Comma-separated sources that produced findings: the engines that ran plus any in-house analyzers. |
+| `plan-tier` | Plan the scan was billed to. Empty when running anonymously on the free tier. |
+| `ci-scans-remaining` | CI scans left in this month's allowance. Empty when anonymous or unlimited. |
+| `sarif-file` / `results-file` | Absolute paths of the files written, when requested. |
+
+## Permissions
+
+```yaml
+permissions:
+  pull-requests: write   # required to post or update the comment
+  id-token: write        # recommended; buckets free-tier quota per repository
+```
+
+Both are optional. Without `pull-requests: write` you get a warning and
+the job summary. Without `id-token: write` the scan still runs and
+free-tier quota is bucketed on the repository name the workflow reports,
+which nothing verifies; with it, the bucket is proven by a GitHub OIDC
+token, so another workflow cannot spend your repository's allowance.
+
+Pull requests from forks receive a read-only token by design, so the
+comment is skipped there. That is expected, and it never fails the
+build.
+
+## How the gate works
+
+The verdict is computed by the scanner, not by this action. The action
+sends your thresholds; the backend applies them to the same finding list
+the hosted report shows, and returns the verdict. This matters because
+two categories of finding appear in the report but deliberately do not
+gate a build:
+
+- **Framework-managed markup.** Component-library portals, consent
+  widgets, reCAPTCHA and Turnstile frames, streaming-SSR artifacts. You
+  cannot fix these in your own code, so failing your build on them asks
+  the impossible.
+- **Rules that are not success criteria.** Best-practice rules with no
+  WCAG criterion behind them, and 4.1.1, which WCAG 2.2 removed.
+
+Both are disclosed in the comment rather than silently dropped. Before
+v2 the action recomputed its own verdict from severity counts and could
+therefore fail a build the report called a pass. There is now one gate.
+`ignore-rules` is applied by the same gate, so a finding you acknowledge
+is skipped by the scanner's verdict rather than by a second one here.
+
+## When a scan is not representative
+
+A bot-detection challenge, a full-page consent dialog, or an HTTP block
+means the engines analysed an interstitial rather than your page. A
+near-clean score on one of those says nothing about your site, so by
+default it fails the build with an explanation rather than passing.
+
+The same applies when the false-positive filtering or the confidence
+scoring did not complete: the findings are then raw engine output, and
+saying so is more useful than a number that looks authoritative.
+
+Set `fail-on-unrepresentative: false` to treat these as advisory. They
+are always shown either way.
+
+A sign-in page is different: nothing on it describes your site, so it is
+never graded. When the URL redirects to a login (Cloudflare Access, Okta,
+Microsoft, Google, Auth0, Vercel deployment protection, your own
+`/login`) or answers HTTP 401, the step fails with "Blocked by sign-in",
+nothing is stored and no scan is counted. See
+[Scan a staging site behind Cloudflare Access](#scan-a-staging-site-behind-cloudflare-access).
 
 ## Free tier
 
 Without a token:
 
-- **10 scans per day per repository**. Enough to dogfood the workflow
-  on every PR before committing to a paid plan.
-- **10 scans per hour** burst protection prevents an accidental loop
-  from exhausting the daily allowance in minutes.
+- **10 scans per day per repository**
+- **10 scans per hour**, so an accidental loop cannot drain the day's
+  allowance in minutes
 
-With a token, your Team ($99/mo) or Business ($399/mo) plan quota
-applies. Sign up at
-[accessibilitypro.app/pricing](https://www.accessibilitypro.app/pricing).
-A token also unlocks **Copy-as-PR** validated diff comments on PRs.
+Add `permissions: id-token: write` so the quota is attributed to your
+repository through a signed GitHub OIDC token rather than to a shared
+runner IP.
+
+## With a token
+
+1. Sign in and open **API tokens** on your
+   [account page](https://www.accessibilitypro.app/account#api-tokens).
+   Name the token and create it. It is shown once, so copy it then.
+2. In your repository, open **Settings → Secrets and variables →
+   Actions** and add a repository secret named
+   `ACCESSIBILITY_PRO_TOKEN` with the token as its value.
+3. Pass it to the Action:
+
+```yaml
+      - uses: accessibility-pro/action@v2
+        with:
+          url: ${{ secrets.STAGING_URL }}
+          accessibility-pro-token: ${{ secrets.ACCESSIBILITY_PRO_TOKEN }}
+```
+
+A token only runs CI scans: it cannot open reports or change billing.
+Revoke it on the same page and the next run that carries it fails with
+the reason, instead of quietly falling back to the free tier. The same
+happens for a token that was mistyped.
+
+Supply `accessibility-pro-token` and scans are attributed to your
+account rather than run anonymously. That means they appear in your
+dashboard and history next to your interactive scans, and they draw on
+your plan's **CI allowance**, which is a separate budget from your
+monthly interactive scans:
+
+| Plan | CI scans / month |
+|---|---|
+| Free (anonymous) | 10 per day per repository |
+| Free (signed in) | 300 |
+| Developer | 1,000 |
+| Team | 10,000 |
+| Business | 40,000 |
+
+CI is metered separately because it is a different workload: a CI scan
+is a single page, where an interactive scan crawls your site and pays
+for AI enrichment. Charging one against the other would have made a
+paid plan worth fewer CI scans than the free tier.
+
+The action prints the remaining allowance on each run and warns at 90%.
+Copy-as-PR fixes are generated in the hosted report and need you signed
+in there; the token does not carry into that surface.
+See [accessibilitypro.app/pricing](https://www.accessibilitypro.app/pricing).
 
 ## Why this is different
 
-Every **Copy as PR** diff is sandbox-validated before emission. We apply
-the patch to the captured DOM, re-run axe on the patched output, and
-only mark the patch **Verified** if it resolves the violations without
-introducing new ones. When the generator cannot produce a safe diff, we
-hand you a code snippet labelled *Needs manual review* instead of a
-broken patch. See our published
+Every **Copy as PR** diff is sandbox-validated before you are offered
+it: the patch is applied to the captured DOM, the page is re-scanned,
+and the diff is only labelled Verified when it resolves the violation
+without introducing new ones. When no safe patch exists you get a
+snippet marked for manual review instead of a broken diff.
+
+Findings carry their evidence level, from `verified by interaction`
+(the keyboard walker actually got trapped) down to `single engine`
+(reported once, not corroborated). Text written by AI is labelled as
+such and never mixed with an engine's own words.
+
+See the published
 [accuracy benchmark](https://www.accessibilitypro.app/benchmark) for
-reproducible precision / recall numbers vs axe-core.
+reproducible precision and recall against axe-core alone.
 
 ## Anti-overlay
 
-We do not sell overlay widgets. Overlays alone cannot bring a site
-into WCAG compliance. The FTC fined accessiBe $1M in January 2025 for
-exactly that claim; 22% of 2025 ADA web lawsuits name overlay-using
-defendants. We fix code, not the appearance of code.
+We do not sell overlay widgets. Overlays cannot bring a site into WCAG
+compliance: they change what a scanner sees, not what a person using
+assistive technology experiences. We fix code, not the appearance of
+code.
+
+## Upgrading from v1
+
+`url`, `wcag-level`, `fail-on`, `accessibility-pro-token`,
+`backend-url` and `report-domain` are unchanged, and `comment-on-pr`
+still works. For most repositories, changing `@v1` to `@v2` is the whole
+migration.
+
+Three behaviours changed on purpose:
+
+1. **The scanner owns the verdict.** Builds that failed on
+   framework-managed findings now pass, matching the report.
+2. **Comments are sticky.** One comment per pull request, updated in
+   place. Use `comment: new` for the old behaviour.
+3. **An unrepresentative scan fails.** Use
+   `fail-on-unrepresentative: false` for the old behaviour.
+
+The action also no longer runs `actions/setup-node` in your job, so it
+cannot change the Node version your other steps see.
+
+See [CHANGELOG.md](CHANGELOG.md) for the full list.
+
+## Development
+
+```bash
+node test/e2e.mjs
+```
+
+The suite spawns the action against a mock backend and a mock GitHub
+API and asserts on exit codes, outputs, job-summary markdown and the
+comment body. There is no build step and no `node_modules`: what CI
+runs is what your runner executes.
 
 ## License
 
-MIT.
+[MIT](LICENSE). The action is open source; the scanning service it
+calls is a hosted product with its own terms.
